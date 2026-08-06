@@ -52,10 +52,20 @@ interface Report {
   generatedAt: string;
 }
 
+interface ReportLink {
+  username: string;
+  source: string;
+  objectKey: string;
+  url: string;
+  urlExpiresAt: string;
+}
+
 const ReportPage: React.FC = () => {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [initialized, setInitialized] = useState(false);
   const [report, setReport] = useState<Report | null>(null);
+  const [link, setLink] = useState<ReportLink | null>(null);
+  const [cdnStatus, setCdnStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -89,6 +99,8 @@ const ReportPage: React.FC = () => {
     await fetch(`${AUTH_URL}/auth/logout`, { method: 'POST', credentials: 'include' });
     setSession(null);
     setReport(null);
+    setLink(null);
+    setCdnStatus(null);
   };
 
   const generateReport = async () => {
@@ -116,7 +128,16 @@ const ReportPage: React.FC = () => {
         throw new Error(`Report request failed: ${response.status}`);
       }
 
-      setReport(await response.json());
+      const meta: ReportLink = await response.json();
+      setLink(meta);
+
+      const cdnResponse = await fetch(meta.url);
+      if (!cdnResponse.ok) {
+        throw new Error(`CDN вернул ${cdnResponse.status}`);
+      }
+      setCdnStatus(cdnResponse.headers.get('X-CDN-Cache'));
+      setReport(await cdnResponse.json());
+
       await loadSession();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -220,6 +241,19 @@ const ReportPage: React.FC = () => {
             <p className="text-sm text-gray-600 mb-4">
               Протезы: {report.prostheses.join(', ') || '—'}
             </p>
+
+            {link && (
+              <div className="mb-6 p-3 bg-gray-50 rounded text-xs text-gray-600">
+                <div>
+                  Источник отчёта:{' '}
+                  <span className="font-semibold">
+                    {link.source === 's3' ? 'готовый объект в S3' : 'сгенерирован и сохранён в S3'}
+                  </span>
+                  {cdnStatus && <> &middot; кеш CDN: <span className="font-semibold">{cdnStatus}</span></>}
+                </div>
+                <div className="mt-1 break-all">Ключ в S3: {link.objectKey}</div>
+              </div>
+            )}
 
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
               <Metric label="Дней в отчёте" value={report.totals.days} />

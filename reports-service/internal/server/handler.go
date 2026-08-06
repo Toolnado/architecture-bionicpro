@@ -3,13 +3,16 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/bionicpro/reports-service/internal/auth"
+	"github.com/bionicpro/reports-service/internal/cdn"
 	"github.com/bionicpro/reports-service/internal/config"
 	"github.com/bionicpro/reports-service/internal/reports"
+	"github.com/bionicpro/reports-service/internal/storage"
 )
 
 const (
@@ -21,10 +24,13 @@ type Handler struct {
 	cfg      *config.Config
 	verifier *auth.Verifier
 	store    *reports.Store
+	objects  *storage.Store
+	signer   *cdn.Signer
 }
 
-func New(cfg *config.Config, verifier *auth.Verifier, store *reports.Store) *Handler {
-	return &Handler{cfg: cfg, verifier: verifier, store: store}
+func New(cfg *config.Config, verifier *auth.Verifier, store *reports.Store,
+	objects *storage.Store, signer *cdn.Signer) *Handler {
+	return &Handler{cfg: cfg, verifier: verifier, store: store, objects: objects, signer: signer}
 }
 
 func (h *Handler) Routes() http.Handler {
@@ -94,16 +100,56 @@ func (h *Handler) reports(w http.ResponseWriter, r *http.Request) {
 		to = covered
 	}
 
-	days, client, err := h.store.Days(r.Context(), identity.Username, from, to)
+	key := objectKey(identity.Username, from, to, covered)
+	source := "s3"
+
+	exists, err := h.objects.Exists(r.Context(), key)
 	if err != nil {
-		log.Printf("read mart: %v", err)
-		writeError(w, http.StatusBadGateway, "report storage is unavailable")
+		log.Printf("stat report object: %v", err)
+		writeError(w, http.StatusBadGateway, "object storage is unavailable")
 		return
 	}
 
-	report := reports.Build(identity.Username, days, from, to, requestedTo, covered)
-	report.Client = client
-	writeJSON(w, http.StatusOK, report)
+	if !exists {
+		days, client, err := h.store.Days(r.Context(), identity.Username, from, to)
+		if err != nil {
+			log.Printf("read mart: %v", err)
+			writeError(w, http.StatusBadGateway, "report storage is unavailable")
+			return
+		}
+
+		report := reports.Build(identity.Username, days, from, to, requestedTo, covered)
+		report.Client = client
+
+		if err := h.objects.PutJSON(r.Context(), key, report); err != nil {
+			log.Printf("store report object: %v", err)
+			writeError(w, http.StatusBadGateway, "object storage is unavailable")
+			return
+		}
+		source = "generated"
+	}
+
+	url, expiresAt := h.signer.Sign("/" + h.objects.Bucket() + "/" + key)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username":     identity.Username,
+		"source":       source,
+		"objectKey":    key,
+		"url":          url,
+		"urlExpiresAt": expiresAt.Format(time.RFC3339),
+		"period": map[string]any{
+			"from":             from.Format(dateLayout),
+			"to":               to.Format(dateLayout),
+			"requestedTo":      requestedTo.Format(dateLayout),
+			"dataCoveredUntil": covered.Format(dateLayout),
+			"truncated":        requestedTo.After(covered),
+		},
+	})
+}
+
+func objectKey(username string, from, to, covered time.Time) string {
+	return fmt.Sprintf("username=%s/covered=%s/%s_%s.json",
+		username, covered.Format(dateLayout), from.Format(dateLayout), to.Format(dateLayout))
 }
 
 func parseDate(raw string, fallback time.Time) (time.Time, error) {

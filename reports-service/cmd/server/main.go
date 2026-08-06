@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/bionicpro/reports-service/internal/auth"
+	"github.com/bionicpro/reports-service/internal/cdn"
 	"github.com/bionicpro/reports-service/internal/config"
 	"github.com/bionicpro/reports-service/internal/reports"
 	"github.com/bionicpro/reports-service/internal/server"
+	"github.com/bionicpro/reports-service/internal/storage"
 )
 
 func main() {
@@ -36,14 +38,22 @@ func run() error {
 	}
 	defer store.Close()
 
+	objects, err := storage.New(ctx, cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey,
+		cfg.S3Bucket, cfg.S3UseSSL, cfg.S3RetentionDays)
+	if err != nil {
+		return err
+	}
+
 	verifier, err := waitForIssuer(ctx, cfg)
 	if err != nil {
 		return err
 	}
 
+	signer := cdn.NewSigner(cfg.CDNBaseURL, cfg.CDNSecret, cfg.CDNLinkTTL)
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           server.New(cfg, verifier, store).Routes(),
+		Handler:           server.New(cfg, verifier, store, objects, signer).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
