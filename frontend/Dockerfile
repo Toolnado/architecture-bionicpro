@@ -13,6 +13,8 @@ RUN npm ci
 COPY . .
 
 # Build the app
+ARG REACT_APP_AUTH_URL=http://localhost:8000
+ENV REACT_APP_AUTH_URL=$REACT_APP_AUTH_URL
 RUN npm run build
 
 # Production stage
