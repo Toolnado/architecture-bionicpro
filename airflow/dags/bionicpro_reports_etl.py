@@ -32,7 +32,7 @@ def clickhouse():
 
 @dag(
     dag_id="bionicpro_reports_etl",
-    description="CRM and telemetry to ClickHouse, daily report mart",
+    description="Telemetry to ClickHouse, report mart is filled by materialized view",
     schedule="0 2 * * *",
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     catchup=False,
@@ -62,42 +62,6 @@ def bionicpro_reports_etl():
         return {"start": start.isoformat(), "end": end.isoformat()}
 
     @task
-    def load_crm_dimensions() -> int:
-        with psycopg2.connect(SOURCES_DSN) as pg, pg.cursor() as cur:
-            cur.execute(
-                "SELECT client_id, username, full_name, city, contract_number FROM crm.clients"
-            )
-            clients = cur.fetchall()
-
-            cur.execute(
-                "SELECT prosthesis_serial, client_id, model, manufactured_at, warranty_until "
-                "FROM crm.prostheses"
-            )
-            prostheses = cur.fetchall()
-
-        with clickhouse() as ch:
-            if clients:
-                ch.insert(
-                    "crm_clients",
-                    clients,
-                    column_names=["client_id", "username", "full_name", "city", "contract_number"],
-                )
-            if prostheses:
-                ch.insert(
-                    "crm_prostheses",
-                    prostheses,
-                    column_names=[
-                        "prosthesis_serial",
-                        "client_id",
-                        "model",
-                        "manufactured_at",
-                        "warranty_until",
-                    ],
-                )
-
-        return len(clients) + len(prostheses)
-
-    @task
     def load_telemetry(window: dict[str, str]) -> int:
         start, end = date.fromisoformat(window["start"]), date.fromisoformat(window["end"])
         if start > end:
@@ -114,6 +78,14 @@ def bionicpro_reports_etl():
             "signal_quality",
             "error_code",
         ]
+
+        with clickhouse() as ch:
+            for table in ("telemetry_raw", "report_daily_v2"):
+                ch.command(
+                    f"DELETE FROM {table} WHERE report_date BETWEEN {{start:Date}} AND {{end:Date}}",
+                    parameters={"start": start, "end": end},
+                    settings={"mutations_sync": 2},
+                )
 
         loaded = 0
         with psycopg2.connect(SOURCES_DSN) as pg, pg.cursor(name="telemetry_stream") as cur:
@@ -147,67 +119,7 @@ def bionicpro_reports_etl():
         return loaded
 
     @task
-    def build_report_mart(window: dict[str, str]) -> int:
-        start, end = date.fromisoformat(window["start"]), date.fromisoformat(window["end"])
-        if start > end:
-            return 0
-
-        with clickhouse() as ch:
-            ch.command(
-                """
-                INSERT INTO report_daily
-                SELECT
-                    c.username,
-                    c.client_id,
-                    c.full_name,
-                    c.city,
-                    c.contract_number,
-                    t.prosthesis_serial,
-                    p.model,
-                    t.report_date,
-                    t.readings_total,
-                    t.gestures_recognized,
-                    round(t.gestures_recognized / t.readings_total, 4) AS recognition_rate,
-                    t.avg_latency_ms,
-                    t.p95_latency_ms,
-                    t.max_latency_ms,
-                    t.min_battery_level,
-                    t.avg_battery_level,
-                    t.avg_signal_quality,
-                    t.error_events,
-                    now() AS generated_at
-                FROM
-                (
-                    SELECT
-                        prosthesis_serial,
-                        report_date,
-                        count() AS readings_total,
-                        countIf(recognized = 1) AS gestures_recognized,
-                        round(avg(latency_ms), 2) AS avg_latency_ms,
-                        round(quantile(0.95)(latency_ms), 2) AS p95_latency_ms,
-                        max(latency_ms) AS max_latency_ms,
-                        round(min(battery_level), 2) AS min_battery_level,
-                        round(avg(battery_level), 2) AS avg_battery_level,
-                        round(avg(signal_quality), 2) AS avg_signal_quality,
-                        countIf(error_code != '') AS error_events
-                    FROM telemetry_raw FINAL
-                    WHERE report_date BETWEEN {start:Date} AND {end:Date}
-                    GROUP BY prosthesis_serial, report_date
-                ) AS t
-                INNER JOIN crm_prostheses AS p FINAL USING (prosthesis_serial)
-                INNER JOIN crm_clients AS c FINAL USING (client_id)
-                """,
-                parameters={"start": start, "end": end},
-            )
-
-            return ch.query(
-                "SELECT count() FROM report_daily FINAL "
-                "WHERE report_date BETWEEN {start:Date} AND {end:Date}",
-                parameters={"start": start, "end": end},
-            ).result_rows[0][0]
-
-    @task
-    def update_watermark(window: dict[str, str], rows: int) -> str:
+    def update_watermark(window: dict[str, str], loaded: int) -> str:
         end = date.fromisoformat(window["end"])
         if date.fromisoformat(window["start"]) > end:
             return "nothing to advance"
@@ -218,17 +130,16 @@ def bionicpro_reports_etl():
                 [[JOB_NAME, end, pendulum.now("UTC").naive()]],
                 column_names=["job", "covered_until", "updated_at"],
             )
+            mart_rows = ch.query(
+                "SELECT count() FROM report_daily_v2 WHERE report_date BETWEEN {start:Date} AND {end:Date}",
+                parameters={"start": date.fromisoformat(window["start"]), "end": end},
+            ).result_rows[0][0]
 
-        return f"covered_until={end.isoformat()}, mart rows={rows}"
+        return f"covered_until={end.isoformat()}, telemetry rows={loaded}, mart rows={mart_rows}"
 
     window = resolve_window()
-    dimensions = load_crm_dimensions()
     telemetry = load_telemetry(window)
-    mart = build_report_mart(window)
-
-    dimensions >> mart
-    telemetry >> mart
-    update_watermark(window, mart)
+    update_watermark(window, telemetry)
 
 
 bionicpro_reports_etl()

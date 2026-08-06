@@ -71,27 +71,66 @@ func (s *Store) CoveredUntil(ctx context.Context) (time.Time, error) {
 	return covered, nil
 }
 
+func (s *Store) DimensionVersion(ctx context.Context, username string) (time.Time, error) {
+	var version time.Time
+
+	row := s.conn.QueryRow(ctx, `
+		SELECT max(ingested_at)
+		FROM
+		(
+		    SELECT ingested_at
+		    FROM cdc_crm_clients FINAL
+		    WHERE username = ?
+
+		    UNION ALL
+
+		    SELECT p.ingested_at
+		    FROM cdc_crm_prostheses AS p FINAL
+		    INNER JOIN
+		    (
+		        SELECT client_id FROM cdc_crm_clients FINAL WHERE username = ?
+		    ) AS c USING (client_id)
+		)`, username, username)
+	if err := row.Scan(&version); err != nil {
+		return time.Time{}, fmt.Errorf("read dimension version: %w", err)
+	}
+	return version, nil
+}
+
 func (s *Store) Days(ctx context.Context, username string, from, to time.Time) ([]Day, *Client, error) {
 	rows, err := s.conn.Query(ctx, `
-		SELECT report_date,
-		       prosthesis_serial,
-		       model,
-		       readings_total,
-		       gestures_recognized,
-		       recognition_rate,
-		       avg_latency_ms,
-		       p95_latency_ms,
-		       max_latency_ms,
-		       min_battery_level,
-		       avg_battery_level,
-		       avg_signal_quality,
-		       error_events,
-		       full_name,
-		       city,
-		       contract_number
-		FROM report_daily FINAL
-		WHERE username = ? AND report_date BETWEEN ? AND ?
-		ORDER BY report_date, prosthesis_serial`,
+		SELECT m.report_date,
+		       m.prosthesis_serial,
+		       p.model,
+		       countMerge(m.readings_total)                          AS readings_total,
+		       countIfMerge(m.gestures_recognized)                   AS gestures_recognized,
+		       round(gestures_recognized / readings_total, 4)        AS recognition_rate,
+		       round(avgMerge(m.avg_latency_ms), 2)                  AS avg_latency_ms,
+		       round(quantileMerge(0.95)(m.p95_latency_ms), 2)       AS p95_latency_ms,
+		       maxMerge(m.max_latency_ms)                            AS max_latency_ms,
+		       round(toFloat64(minMerge(m.min_battery_level)), 2)     AS min_battery_level,
+		       round(avgMerge(m.avg_battery_level), 2)               AS avg_battery_level,
+		       round(avgMerge(m.avg_signal_quality), 2)              AS avg_signal_quality,
+		       countIfMerge(m.error_events)                          AS error_events,
+		       c.full_name,
+		       c.city,
+		       c.contract_number
+		FROM report_daily_v2 AS m
+		INNER JOIN
+		(
+		    SELECT prosthesis_serial, model
+		    FROM cdc_crm_prostheses FINAL
+		    WHERE is_deleted = 0
+		) AS p USING (prosthesis_serial)
+		INNER JOIN
+		(
+		    SELECT username, full_name, city, contract_number
+		    FROM cdc_crm_clients FINAL
+		    WHERE is_deleted = 0
+		) AS c USING (username)
+		WHERE m.username = ? AND m.report_date BETWEEN ? AND ?
+		GROUP BY m.report_date, m.prosthesis_serial, p.model, c.full_name, c.city, c.contract_number
+		ORDER BY m.report_date, m.prosthesis_serial`,
 		username, from, to)
 	if err != nil {
 		return nil, nil, fmt.Errorf("query mart: %w", err)

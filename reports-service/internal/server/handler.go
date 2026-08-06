@@ -100,7 +100,14 @@ func (h *Handler) reports(w http.ResponseWriter, r *http.Request) {
 		to = covered
 	}
 
-	key := objectKey(identity.Username, from, to, covered)
+	crmVersion, err := h.store.DimensionVersion(r.Context(), identity.Username)
+	if err != nil {
+		log.Printf("read dimension version: %v", err)
+		writeError(w, http.StatusBadGateway, "report storage is unavailable")
+		return
+	}
+
+	key := objectKey(identity.Username, from, to, covered, crmVersion)
 	source := "s3"
 
 	exists, err := h.objects.Exists(r.Context(), key)
@@ -147,9 +154,10 @@ func (h *Handler) reports(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func objectKey(username string, from, to, covered time.Time) string {
-	return fmt.Sprintf("username=%s/covered=%s/%s_%s.json",
-		username, covered.Format(dateLayout), from.Format(dateLayout), to.Format(dateLayout))
+func objectKey(username string, from, to, covered, crmVersion time.Time) string {
+	return fmt.Sprintf("username=%s/covered=%s/crm=%d/%s_%s.json",
+		username, covered.Format(dateLayout), crmVersion.Unix(),
+		from.Format(dateLayout), to.Format(dateLayout))
 }
 
 func parseDate(raw string, fallback time.Time) (time.Time, error) {
