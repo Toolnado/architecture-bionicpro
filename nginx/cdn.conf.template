@@ -1,0 +1,61 @@
+proxy_cache_path /var/cache/nginx/cdn
+                 levels=1:2
+                 keys_zone=cdn_cache:16m
+                 max_size=2g
+                 inactive=30d
+                 use_temp_path=off;
+
+upstream object_storage {
+    server minio:9000;
+    keepalive 16;
+}
+
+server {
+    listen 8080;
+    server_name _;
+
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    location /reports/ {
+        secure_link $arg_token,$arg_expires;
+        secure_link_md5 "$secure_link_expires$uri ${CDN_SECRET}";
+
+        if ($secure_link = "") {
+            return 403;
+        }
+        if ($secure_link = "0") {
+            return 410;
+        }
+
+        proxy_cache cdn_cache;
+        proxy_cache_key $uri;
+        proxy_cache_valid 200 30d;
+        proxy_cache_valid 404 10s;
+        proxy_cache_lock on;
+        proxy_cache_revalidate on;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        proxy_ignore_headers Set-Cookie Vary;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_hide_header Set-Cookie;
+        proxy_hide_header x-amz-request-id;
+        proxy_hide_header x-amz-id-2;
+
+        proxy_pass http://object_storage$uri;
+
+        add_header X-CDN-Cache $upstream_cache_status always;
+        add_header Access-Control-Allow-Origin "${CDN_ALLOWED_ORIGIN}" always;
+        add_header Access-Control-Expose-Headers "X-CDN-Cache" always;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }
+
+    location / {
+        return 404;
+    }
+}
